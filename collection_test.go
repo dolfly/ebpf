@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/go-quicktest/qt"
-	"github.com/google/go-cmp/cmp"
 
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/btf"
@@ -47,11 +46,7 @@ func TestCollectionSpecNotModified(t *testing.T) {
 		},
 	}
 
-	coll, err := NewCollection(&cs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	coll.Close()
+	mustNewCollection(t, &cs, nil)
 
 	if cs.Programs["test"].Instructions[0].Constant != 0 {
 		t.Error("Creating a collection modifies input spec")
@@ -109,17 +104,11 @@ func TestCollectionSpecLoadCopy(t *testing.T) {
 		Prog *Program `ebpf:"xdp_prog"`
 	}
 
-	err = spec.LoadAndAssign(&objs, nil)
-	testutils.SkipIfNotSupported(t, err)
-	if err != nil {
-		t.Fatal("Loading original spec:", err)
-	}
-	defer objs.Prog.Close()
+	mustLoadAndAssign(t, spec, &objs, nil)
+	qt.Assert(t, qt.IsNil(objs.Prog.Close()))
 
-	if err := spec2.LoadAndAssign(&objs, nil); err != nil {
-		t.Fatal("Loading copied spec:", err)
-	}
-	defer objs.Prog.Close()
+	mustLoadAndAssign(t, spec2, &objs, nil)
+	qt.Assert(t, qt.IsNil(objs.Prog.Close()))
 }
 
 func TestCollectionSpecLoadMutate(t *testing.T) {
@@ -135,14 +124,9 @@ func TestCollectionSpecLoadMutate(t *testing.T) {
 		Prog *Program `ebpf:"xdp_prog"`
 	}
 
-	err = spec.LoadAndAssign(&objs, nil)
-	testutils.SkipIfNotSupported(t, err)
-	qt.Assert(t, qt.IsNil(err))
-	defer objs.Prog.Close()
-
-	if diff := cmp.Diff(orig, spec, csCmpOpts...); diff != "" {
-		t.Errorf("CollectionSpec was mutated after loading (-want +got):\n%s", diff)
-	}
+	mustLoadAndAssign(t, spec, &objs, nil)
+	qt.Assert(t, qt.IsNil(objs.Prog.Close()))
+	qt.Assert(t, qt.CmpEquals(spec, orig, csCmpOpts))
 }
 
 func TestCollectionSpecRewriteMaps(t *testing.T) {
@@ -179,13 +163,9 @@ func TestCollectionSpecRewriteMaps(t *testing.T) {
 	}
 
 	// Override the map with another one
-	newMap, err := NewMap(cs.Maps["test-map"])
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer newMap.Close()
+	newMap := mustNewMap(t, cs.Maps["test-map"], nil)
 
-	err = newMap.Put(uint32(0), uint32(2))
+	err := newMap.Put(uint32(0), uint32(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,11 +181,7 @@ func TestCollectionSpecRewriteMaps(t *testing.T) {
 		t.Error("RewriteMaps doesn't remove map from CollectionSpec.Maps")
 	}
 
-	coll, err := NewCollection(cs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer coll.Close()
+	coll := mustNewCollection(t, cs, nil)
 
 	ret, _, err := coll.Programs["test-prog"].Test(internal.EmptyBPFContext)
 	testutils.SkipIfNotSupported(t, err)
@@ -252,26 +228,18 @@ func TestCollectionSpecMapReplacements(t *testing.T) {
 	}
 
 	// Replace the map with another one
-	newMap, err := NewMap(cs.Maps["test-map"])
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer newMap.Close()
+	newMap := mustNewMap(t, cs.Maps["test-map"], nil)
 
-	err = newMap.Put(uint32(0), uint32(2))
+	err := newMap.Put(uint32(0), uint32(2))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	coll, err := NewCollectionWithOptions(cs, CollectionOptions{
+	coll := mustNewCollection(t, cs, &CollectionOptions{
 		MapReplacements: map[string]*Map{
 			"test-map": newMap,
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer coll.Close()
 
 	ret, _, err := coll.Programs["test-prog"].Test(internal.EmptyBPFContext)
 	testutils.SkipIfNotSupported(t, err)
@@ -304,13 +272,9 @@ func TestCollectionSpecMapReplacements_NonExistingMap(t *testing.T) {
 	}
 
 	// Override non-existing map
-	newMap, err := NewMap(cs.Maps["test-map"])
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer newMap.Close()
+	newMap := mustNewMap(t, cs.Maps["test-map"], nil)
 
-	coll, err := NewCollectionWithOptions(cs, CollectionOptions{
+	coll, err := newCollection(t, cs, &CollectionOptions{
 		MapReplacements: map[string]*Map{
 			"non-existing-map": newMap,
 		},
@@ -334,19 +298,14 @@ func TestCollectionSpecMapReplacements_SpecMismatch(t *testing.T) {
 	}
 
 	// Override map with mismatching spec
-	newMap, err := NewMap(&MapSpec{
+	newMap := mustNewMap(t, &MapSpec{
 		Type:       Array,
 		KeySize:    4,
 		ValueSize:  8, // this is different
 		MaxEntries: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Map fd is duplicated by MapReplacements, this one can be safely closed.
-	defer newMap.Close()
+	}, nil)
 
-	coll, err := NewCollectionWithOptions(cs, CollectionOptions{
+	coll, err := newCollection(t, cs, &CollectionOptions{
 		MapReplacements: map[string]*Map{
 			"test-map": newMap,
 		},
@@ -375,21 +334,18 @@ func TestMapReplacementsDataSections(t *testing.T) {
 		ROData *Map `ebpf:".rodata"`
 	}
 
-	err = spec.LoadAndAssign(&objs, nil)
-	testutils.SkipIfNotSupported(t, err)
-	qt.Assert(t, qt.IsNil(err))
+	mustLoadAndAssign(t, spec, &objs, nil)
 	defer objs.Data.Close()
 	defer objs.ROData.Close()
 
-	qt.Assert(t, qt.IsNil(
-		spec.LoadAndAssign(&objs, &CollectionOptions{
-			MapReplacements: map[string]*Map{
-				".data":   objs.Data,
-				".rodata": objs.ROData,
-			},
-		})))
-	defer objs.Data.Close()
-	defer objs.ROData.Close()
+	mustLoadAndAssign(t, spec, &objs, &CollectionOptions{
+		MapReplacements: map[string]*Map{
+			".data":   objs.Data,
+			".rodata": objs.ROData,
+		},
+	})
+	qt.Assert(t, qt.IsNil(objs.Data.Close()))
+	qt.Assert(t, qt.IsNil(objs.ROData.Close()))
 }
 
 func TestCollectionSpec_LoadAndAssign_LazyLoading(t *testing.T) {
@@ -431,9 +387,7 @@ func TestCollectionSpec_LoadAndAssign_LazyLoading(t *testing.T) {
 		Map  *Map     `ebpf:"valid"`
 	}
 
-	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		t.Fatal("Assign loads a map or program that isn't requested in the struct:", err)
-	}
+	mustLoadAndAssign(t, spec, &objs, nil)
 	defer objs.Prog.Close()
 	defer objs.Map.Close()
 
@@ -602,9 +556,7 @@ func TestCollectionAssign(t *testing.T) {
 		},
 	}
 
-	coll, err := NewCollection(cs)
-	qt.Assert(t, qt.IsNil(err))
-	defer coll.Close()
+	coll := mustNewCollection(t, cs, nil)
 
 	qt.Assert(t, qt.IsNil(coll.Assign(&objs)))
 	defer objs.Program.Close()
@@ -647,9 +599,7 @@ func TestCollectionAssignFail(t *testing.T) {
 		},
 	}
 
-	coll, err := NewCollection(cs)
-	qt.Assert(t, qt.IsNil(err))
-	defer coll.Close()
+	coll := mustNewCollection(t, cs, nil)
 
 	qt.Assert(t, qt.IsNotNil(coll.Assign(&objs)))
 
@@ -686,7 +636,7 @@ func TestIncompleteLoadAndAssign(t *testing.T) {
 		Invalid *Program `ebpf:"invalid"`
 	}{}
 
-	if err := spec.LoadAndAssign(&s, nil); err == nil {
+	if err := loadAndAssign(t, spec, &s, nil); err == nil {
 		t.Fatal("expected error loading invalid ProgramSpec")
 	}
 
