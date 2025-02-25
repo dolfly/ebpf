@@ -309,8 +309,13 @@ func newProgramInfoFromFd(fd *sys.FD) (*ProgramInfo, error) {
 		pi.maps = nil
 	}
 
+	if platform.IsWindows {
+		if info.Tag == [8]uint8{} {
+			pi.Tag = ""
+		}
+	}
 	// createdByUID and NrMapIds were introduced in the same kernel version.
-	if pi.maps != nil {
+	if pi.maps != nil && platform.IsLinux {
 		pi.createdByUID = info.CreatedByUid
 		pi.haveCreatedByUID = true
 	}
@@ -390,7 +395,7 @@ func newProgramInfoFromProc(fd *sys.FD) (*ProgramInfo, error) {
 		"prog_type": &progType,
 		"prog_tag":  &info.Tag,
 	})
-	if errors.Is(err, ErrNotSupported) {
+	if errors.Is(err, ErrNotSupported) && !errors.Is(err, internal.ErrNotSupportedOnOS) {
 		return nil, &internal.UnsupportedFeatureError{
 			Name:           "reading program info from /proc/self/fdinfo",
 			MinimumVersion: internal.Version{4, 10, 0},
@@ -735,6 +740,10 @@ func (pi *ProgramInfo) FuncInfos() (btf.FuncOffsets, error) {
 }
 
 func scanFdInfo(fd *sys.FD, fields map[string]interface{}) error {
+	if platform.IsWindows {
+		return fmt.Errorf("read fdinfo: %w", internal.ErrNotSupportedOnOS)
+	}
+
 	fh, err := os.Open(fmt.Sprintf("/proc/self/fdinfo/%d", fd.Int()))
 	if err != nil {
 		return err
@@ -815,6 +824,10 @@ func EnableStats(which uint32) (io.Closer, error) {
 }
 
 var haveProgramInfoMapIDs = internal.NewFeatureTest("map IDs in program info", func() error {
+	if platform.IsWindows {
+		return nil
+	}
+
 	prog, err := progLoad(asm.Instructions{
 		asm.LoadImm(asm.R0, 0, asm.DWord),
 		asm.Return(),
@@ -839,4 +852,4 @@ var haveProgramInfoMapIDs = internal.NewFeatureTest("map IDs in program info", f
 	}
 
 	return err
-}, "4.15")
+}, "4.15", "windows:0.20.0")

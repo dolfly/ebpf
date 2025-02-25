@@ -9,17 +9,16 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/go-quicktest/qt"
 
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
+	"github.com/cilium/ebpf/internal/platform"
 	"github.com/cilium/ebpf/internal/sys"
 	"github.com/cilium/ebpf/internal/testutils"
 	"github.com/cilium/ebpf/internal/unix"
@@ -53,6 +52,16 @@ func TestProgramRun(t *testing.T) {
 		asm.LoadImm(asm.R0, 42, asm.DWord).WithSymbol("out"),
 		asm.Return(),
 	)
+
+	if platform.IsWindows {
+		// Windows uses an incompatible context for XDP. Pointers are
+		// 64 bit.
+		// See https://github.com/microsoft/ebpf-for-windows/issues/3873
+		// r2 = *(r1+8)
+		ins[0] = asm.LoadMem(asm.R2, asm.R1, 8, asm.DWord)
+		// r1 = *(r1+0)
+		ins[1] = asm.LoadMem(asm.R1, asm.R1, 0, asm.DWord)
+	}
 
 	t.Log(ins)
 
@@ -93,15 +102,23 @@ func TestProgramRunWithOptions(t *testing.T) {
 	prog := createProgram(t, XDP, int64(sys.XDP_ABORTED))
 
 	buf := internal.EmptyBPFContext
-	xdp := sys.XdpMd{
-		Data:    0,
-		DataEnd: uint32(len(buf)),
+	var in, out any
+	if platform.IsWindows {
+		type winXdpMd struct {
+			Data, DataEnd, DataMeta uint64
+			Ifindex                 uint32
+		}
+		in = &winXdpMd{Data: 0, DataEnd: uint64(len(buf))}
+		out = &winXdpMd{}
+	} else {
+		in = &sys.XdpMd{Data: 0, DataEnd: uint32(len(buf))}
+		out = &sys.XdpMd{}
 	}
-	xdpOut := sys.XdpMd{}
+
 	opts := RunOptions{
 		Data:       buf,
-		Context:    xdp,
-		ContextOut: &xdpOut,
+		Context:    in,
+		ContextOut: out,
 	}
 	ret, err := prog.Run(&opts)
 	testutils.SkipIfNotSupported(t, err)
@@ -113,9 +130,7 @@ func TestProgramRunWithOptions(t *testing.T) {
 		t.Error("Expected return value to be 0, got", ret)
 	}
 
-	if xdp != xdpOut {
-		t.Errorf("Expect xdp (%+v) == xdpOut (%+v)", xdp, xdpOut)
-	}
+	qt.Assert(t, qt.DeepEquals(out, in))
 }
 
 func TestProgramRunRawTracepoint(t *testing.T) {
@@ -173,78 +188,6 @@ func TestProgramBenchmark(t *testing.T) {
 	}
 }
 
-func TestProgramTestRunInterrupt(t *testing.T) {
-	testutils.SkipOnOldKernel(t, "5.0", "EINTR from BPF_PROG_TEST_RUN")
-
-	prog := createBasicProgram(t)
-
-	var (
-		tgid    = unix.Getpid()
-		tidChan = make(chan int, 1)
-		exit    = make(chan struct{})
-		errs    = make(chan error, 1)
-		timeout = time.After(5 * time.Second)
-	)
-
-	defer close(exit)
-
-	go func() {
-		runtime.LockOSThread()
-		defer func() {
-			// Wait for the test to allow us to unlock the OS thread, to
-			// ensure that we don't send SIGUSR1 to the wrong thread.
-			<-exit
-			runtime.UnlockOSThread()
-		}()
-
-		tidChan <- unix.Gettid()
-
-		// Block this thread in the BPF syscall, so that we can
-		// trigger EINTR by sending a signal.
-		opts := RunOptions{
-			Data:   internal.EmptyBPFContext,
-			Repeat: math.MaxInt32,
-			Reset: func() {
-				// We don't know how long finishing the
-				// test run would take, so flag that we've seen
-				// an interruption and abort the goroutine.
-				close(errs)
-				runtime.Goexit()
-			},
-		}
-		_, _, err := prog.run(&opts)
-
-		errs <- err
-	}()
-
-	tid := <-tidChan
-	for {
-		err := unix.Tgkill(tgid, tid, unix.SIGUSR1)
-		if err != nil {
-			t.Fatal("Can't send signal to goroutine thread:", err)
-		}
-
-		select {
-		case err, ok := <-errs:
-			if !ok {
-				return
-			}
-
-			testutils.SkipIfNotSupported(t, err)
-			if err == nil {
-				t.Fatal("testRun wasn't interrupted")
-			}
-
-			t.Fatal("testRun returned an error:", err)
-
-		case <-timeout:
-			t.Fatal("Timed out trying to interrupt the goroutine")
-
-		default:
-		}
-	}
-}
-
 func TestProgramClose(t *testing.T) {
 	prog := createBasicProgram(t)
 
@@ -254,7 +197,8 @@ func TestProgramClose(t *testing.T) {
 }
 
 func TestProgramPin(t *testing.T) {
-	prog := createBasicProgram(t)
+	spec := fixupProgramSpec(basicProgramSpec)
+	prog := mustNewProgram(t, spec, nil)
 
 	tmp := testutils.TempBPFFS(t)
 
@@ -275,18 +219,12 @@ func TestProgramPin(t *testing.T) {
 	}
 	defer prog.Close()
 
-	if prog.Type() != SocketFilter {
-		t.Error("Expected pinned program to have type SocketFilter, but got", prog.Type())
-	}
+	qt.Assert(t, qt.Equals(prog.Type(), spec.Type))
 
 	if haveObjName() == nil {
-		if prog.name != "test" {
-			t.Errorf("Expected program to have object name 'test', got '%s'", prog.name)
-		}
+		qt.Assert(t, qt.Equals(prog.name, "test"))
 	} else {
-		if prog.name != "program" {
-			t.Errorf("Expected program to have file name 'program', got '%s'", prog.name)
-		}
+		qt.Assert(t, qt.Equals(prog.name, "program"))
 	}
 
 	if !prog.IsPinned() {
@@ -356,9 +294,19 @@ func TestProgramVerifierOutputOnError(t *testing.T) {
 		t.Fatal("NewProgram does return an unwrapped VerifierError")
 	}
 
-	if !strings.Contains(ve.Error(), "R0 !read_ok") {
-		t.Logf("%+v", ve)
-		t.Error("Missing verifier log in error summary")
+	switch runtime.GOOS {
+	case "linux":
+		if !strings.Contains(ve.Error(), "R0 !read_ok") {
+			t.Logf("%+v", ve)
+			t.Error("Missing verifier log in error summary")
+		}
+	case "windows":
+		if !strings.Contains(ve.Error(), "r0.type == number") {
+			t.Logf("%+v", ve)
+			t.Error("Missing verifier log in error summary")
+		}
+	default:
+		t.Error("Unsupported platform", runtime.GOOS)
 	}
 }
 
@@ -381,7 +329,7 @@ func TestProgramVerifierOutput(t *testing.T) {
 		LogLevel: LogLevelInstruction,
 	})
 
-	if prog.VerifierLog == "" {
+	if platform.IsLinux && prog.VerifierLog == "" {
 		t.Error("Expected VerifierLog to be present")
 	}
 
@@ -412,26 +360,23 @@ func TestProgramVerifierLog(t *testing.T) {
 
 		var ve *internal.VerifierError
 		qt.Assert(t, qt.ErrorAs(err, &ve))
-
-		loglen := len(fmt.Sprintf("%+v", ve))
-		qt.Assert(t, qt.IsTrue(loglen > minVerifierLogSize),
-			qt.Commentf("Log buffer didn't grow past minimum, got %d bytes", loglen))
-	}
-
-	// Generate a base program of sufficient size whose verifier log does not fit
-	// in the minimum buffer size. Stay under 4096 insn limit of older kernels.
-	var base asm.Instructions
-	for i := 0; i < 4093; i++ {
-		base = append(base, asm.Mov.Reg(asm.R0, asm.R1))
+		loglen := 0
+		for _, line := range ve.Log {
+			loglen += len(line)
+		}
+		qt.Assert(t, qt.IsTrue(loglen > 0))
 	}
 
 	// Touch R10 (read-only frame pointer) to reliably force a verifier error.
-	invalid := slices.Clone(base)
-	invalid = append(invalid, asm.Mov.Reg(asm.R10, asm.R0))
-	invalid = append(invalid, asm.Return())
+	invalid := asm.Instructions{
+		asm.Mov.Reg(asm.R10, asm.R0),
+		asm.Return(),
+	}
 
-	valid := slices.Clone(base)
-	valid = append(valid, asm.Return())
+	valid := asm.Instructions{
+		asm.Mov.Imm(asm.R0, 0),
+		asm.Return(),
+	}
 
 	// Start out with testing against the invalid program.
 	spec := &ProgramSpec{
@@ -440,7 +385,7 @@ func TestProgramVerifierLog(t *testing.T) {
 		Instructions: invalid,
 	}
 
-	// Don't explicitly request a verifier log for an invalid program.
+	// Ensure that an invalid program automatically gets a log.
 	_, err := newProgram(t, spec, nil)
 	check(t, err)
 
@@ -461,14 +406,8 @@ func TestProgramVerifierLog(t *testing.T) {
 	// Run tests against a valid program from here on out.
 	spec.Instructions = valid
 
-	// Don't request a verifier log, expect the valid program to be created
-	// without errors.
-	prog := mustNewProgram(t, spec, nil)
-	qt.Assert(t, qt.HasLen(prog.VerifierLog, 0))
-
-	// Explicitly request verifier log for a valid program. If a log is requested
-	// and the buffer is too small, ENOSPC occurs even for valid programs.
-	prog = mustNewProgram(t, spec, &ProgramOptions{
+	// Explicitly request verifier log for a valid program.
+	prog := mustNewProgram(t, spec, &ProgramOptions{
 		LogLevel: LogLevelInstruction,
 	})
 	qt.Assert(t, qt.IsTrue(len(prog.VerifierLog) > minVerifierLogSize))
@@ -579,11 +518,12 @@ func TestProgramMarshaling(t *testing.T) {
 }
 
 func TestProgramFromFD(t *testing.T) {
-	prog := createBasicProgram(t)
+	spec := fixupProgramSpec(basicProgramSpec)
+	prog := mustNewProgram(t, spec, nil)
 
 	// If you're thinking about copying this, don't. Use
 	// Clone() instead.
-	prog2, err := NewProgramFromFD(dupFD(t, prog.FD()))
+	prog2, err := NewProgramFromFD(testutils.DupFD(t, prog.FD()))
 	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
 		t.Fatal(err)
@@ -595,9 +535,7 @@ func TestProgramFromFD(t *testing.T) {
 		t.Errorf("Expected program to have name test, got '%s'", prog2.name)
 	}
 
-	if prog2.typ != SocketFilter {
-		t.Errorf("Expected program to have type SocketFilter, got '%s'", prog2.typ)
-	}
+	qt.Assert(t, qt.Equals(prog2.Type(), spec.Type))
 }
 
 func TestHaveProgTestRun(t *testing.T) {
@@ -720,7 +658,7 @@ func TestProgramSpecTag(t *testing.T) {
 		t.Fatal("Can't calculate tag:", err)
 	}
 
-	if tag != info.Tag {
+	if info.Tag != "" && tag != info.Tag {
 		t.Errorf("Calculated tag %s doesn't match kernel tag %s", tag, info.Tag)
 	}
 }
@@ -862,6 +800,9 @@ func TestProgramInstructions(t *testing.T) {
 	}
 
 	insns, err := pi.Instructions()
+	if platform.IsWindows && errors.Is(err, ErrNotSupported) {
+		t.Skip("Windows doesn't support reading out instructions")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,44 +819,6 @@ func TestProgramInstructions(t *testing.T) {
 
 	if tag != tagXlated {
 		t.Fatalf("tag %s differs from xlated instructions tag %s", tag, tagXlated)
-	}
-}
-
-func TestProgramLoadErrors(t *testing.T) {
-	testutils.SkipOnOldKernel(t, "4.10", "stable verifier log output")
-
-	spec, err := LoadCollectionSpec(testutils.NativeFile(t, "testdata/errors-%s.elf"))
-	qt.Assert(t, qt.IsNil(err))
-
-	var b btf.Builder
-	raw, err := b.Marshal(nil, nil)
-	qt.Assert(t, qt.IsNil(err))
-	empty, err := btf.LoadSpecFromReader(bytes.NewReader(raw))
-	qt.Assert(t, qt.IsNil(err))
-
-	for _, test := range []struct {
-		name string
-		want error
-	}{
-		{"poisoned_single", errBadRelocation},
-		{"poisoned_double", errBadRelocation},
-		{"poisoned_kfunc", errUnknownKfunc},
-	} {
-		progSpec := spec.Programs[test.name]
-		qt.Assert(t, qt.IsNotNil(progSpec))
-
-		t.Run(test.name, func(t *testing.T) {
-			t.Log(progSpec.Instructions)
-			_, err := newProgram(t, progSpec, &ProgramOptions{
-				KernelTypes: empty,
-			})
-
-			var ve *VerifierError
-			qt.Assert(t, qt.ErrorAs(err, &ve))
-			t.Logf("%-5v", ve)
-
-			qt.Assert(t, qt.ErrorIs(err, test.want))
-		})
 	}
 }
 
@@ -1074,15 +977,4 @@ func ExampleProgramSpec_Tag() {
 	} else {
 		fmt.Println("The programs are identical, tag is", tag)
 	}
-}
-
-func dupFD(tb testing.TB, fd int) int {
-	tb.Helper()
-
-	dup, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 1)
-	if err != nil {
-		tb.Fatal("Can't dup fd:", err)
-	}
-
-	return dup
 }

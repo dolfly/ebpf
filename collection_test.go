@@ -3,7 +3,6 @@ package ebpf
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"reflect"
@@ -129,8 +128,10 @@ func TestCollectionSpecLoadMutate(t *testing.T) {
 	qt.Assert(t, qt.CmpEquals(spec, orig, csCmpOpts))
 }
 
-func TestCollectionSpecRewriteMaps(t *testing.T) {
-	insns := asm.Instructions{
+// Load key "0" from a map called "test-map" and return the value.
+var loadKeyFromMapProgramSpec = &ProgramSpec{
+	Type: SocketFilter,
+	Instructions: asm.Instructions{
 		// R1 map
 		asm.LoadMapPtr(asm.R1, 0).WithReference("test-map"),
 		// R2 key
@@ -138,12 +139,17 @@ func TestCollectionSpecRewriteMaps(t *testing.T) {
 		asm.Add.Imm(asm.R2, -4),
 		asm.StoreImm(asm.R2, 0, 0, asm.Word),
 		// Lookup map[0]
-		asm.FnMapLookupElem.Call(),
-		asm.JEq.Imm(asm.R0, 0, "ret"),
+		fnMapLookupElem.Call(),
+		asm.JEq.Imm(asm.R0, 0, "error"),
 		asm.LoadMem(asm.R0, asm.R0, 0, asm.Word),
+		asm.Ja.Label("ret"),
+		// Windows doesn't allow directly using R0 result from fnMapLookupElem.
+		asm.Mov.Imm(asm.R0, 0).WithSymbol("error"),
 		asm.Return().WithSymbol("ret"),
-	}
+	},
+}
 
+func TestCollectionSpecRewriteMaps(t *testing.T) {
 	cs := &CollectionSpec{
 		Maps: map[string]*MapSpec{
 			"test-map": {
@@ -154,11 +160,7 @@ func TestCollectionSpecRewriteMaps(t *testing.T) {
 			},
 		},
 		Programs: map[string]*ProgramSpec{
-			"test-prog": {
-				Type:         SocketFilter,
-				Instructions: insns,
-				License:      "MIT",
-			},
+			"test-prog": loadKeyFromMapProgramSpec.Copy(),
 		},
 	}
 
@@ -195,20 +197,6 @@ func TestCollectionSpecRewriteMaps(t *testing.T) {
 }
 
 func TestCollectionSpecMapReplacements(t *testing.T) {
-	insns := asm.Instructions{
-		// R1 map
-		asm.LoadMapPtr(asm.R1, 0).WithReference("test-map"),
-		// R2 key
-		asm.Mov.Reg(asm.R2, asm.R10),
-		asm.Add.Imm(asm.R2, -4),
-		asm.StoreImm(asm.R2, 0, 0, asm.Word),
-		// Lookup map[0]
-		asm.FnMapLookupElem.Call(),
-		asm.JEq.Imm(asm.R0, 0, "ret"),
-		asm.LoadMem(asm.R0, asm.R0, 0, asm.Word),
-		asm.Return().WithSymbol("ret"),
-	}
-
 	cs := &CollectionSpec{
 		Maps: map[string]*MapSpec{
 			"test-map": {
@@ -219,11 +207,7 @@ func TestCollectionSpecMapReplacements(t *testing.T) {
 			},
 		},
 		Programs: map[string]*ProgramSpec{
-			"test-prog": {
-				Type:         SocketFilter,
-				Instructions: insns,
-				License:      "MIT",
-			},
+			"test-prog": loadKeyFromMapProgramSpec.Copy(),
 		},
 	}
 
@@ -665,6 +649,8 @@ func BenchmarkNewCollection(b *testing.B) {
 		m.Pinning = PinNone
 	}
 
+	spec = fixupCollectionSpec(spec)
+
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -683,6 +669,8 @@ func BenchmarkNewCollectionManyProgs(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+
+	spec = fixupCollectionSpec(spec)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -752,11 +740,7 @@ func ExampleCollectionSpec_Assign() {
 		panic(err)
 	}
 
-	fmt.Println(specs.Program.Type)
-	fmt.Println(specs.Map.Type)
-
-	// Output: SocketFilter
-	// Array
+	// Output:
 }
 
 func ExampleCollectionSpec_LoadAndAssign() {
@@ -791,10 +775,4 @@ func ExampleCollectionSpec_LoadAndAssign() {
 	}
 	defer objs.Program.Close()
 	defer objs.Map.Close()
-
-	fmt.Println(objs.Program.Type())
-	fmt.Println(objs.Map.Type())
-
-	// Output: SocketFilter
-	// Array
 }

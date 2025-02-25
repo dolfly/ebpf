@@ -711,6 +711,10 @@ func resolveKconfig(m *MapSpec) error {
 		return errors.New("map value is not a Datasec")
 	}
 
+	if platform.IsWindows {
+		return fmt.Errorf(".kconfig: %w", internal.ErrNotSupportedOnOS)
+	}
+
 	type configInfo struct {
 		offset uint32
 		size   uint32

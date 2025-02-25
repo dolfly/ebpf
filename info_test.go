@@ -14,6 +14,7 @@ import (
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
+	"github.com/cilium/ebpf/internal/platform"
 	"github.com/cilium/ebpf/internal/sys"
 	"github.com/cilium/ebpf/internal/testutils"
 )
@@ -43,6 +44,10 @@ var multiprogSpec = &ProgramSpec{
 }
 
 func TestMapInfoFromProc(t *testing.T) {
+	if platform.IsWindows {
+		t.Skip("Windows doesn't support /proc.")
+	}
+
 	hash := mustNewMap(t, &MapSpec{
 		Type:       Hash,
 		KeySize:    4,
@@ -85,68 +90,71 @@ func TestMapInfoFromProcOuterMap(t *testing.T) {
 	qt.Assert(t, qt.Equals(info.MaxEntries, 2))
 }
 
-func validateProgInfo(t *testing.T, info *ProgramInfo) {
+func validateProgInfo(t *testing.T, spec *ProgramSpec, info *ProgramInfo) {
 	t.Helper()
 
-	qt.Assert(t, qt.Equals(info.Type, SocketFilter))
-	qt.Assert(t, qt.Equals(info.Tag, "d7edec644f05498d"))
+	qt.Assert(t, qt.Equals(info.Type, spec.Type))
+	if info.Tag != "" {
+		qt.Assert(t, qt.Equals(info.Tag, "d7edec644f05498d"))
+	}
 }
 
 func TestProgramInfo(t *testing.T) {
-	prog := createBasicProgram(t)
+	spec := fixupProgramSpec(basicProgramSpec)
+	prog := mustNewProgram(t, spec, nil)
 
 	info, err := newProgramInfoFromFd(prog.fd)
 	testutils.SkipIfNotSupported(t, err)
 	qt.Assert(t, qt.IsNil(err))
 
-	validateProgInfo(t, info)
+	validateProgInfo(t, spec, info)
 
 	id, ok := info.ID()
 	qt.Assert(t, qt.IsTrue(ok))
 	qt.Assert(t, qt.Not(qt.Equals(id, 0)))
 
-	if testutils.IsKernelLessThan(t, "4.15") {
+	if testutils.IsVersionLessThan(t, "4.15", "windows:0.20") {
 		qt.Assert(t, qt.Equals(info.Name, ""))
 	} else {
 		qt.Assert(t, qt.Equals(info.Name, "test"))
 	}
 
-	if jitedSize, err := info.JitedSize(); testutils.IsKernelLessThan(t, "4.13") {
+	if jitedSize, err := info.JitedSize(); testutils.IsVersionLessThan(t, "4.13") {
 		qt.Assert(t, qt.IsNotNil(err))
 	} else {
 		qt.Assert(t, qt.IsNil(err))
 		qt.Assert(t, qt.IsTrue(jitedSize > 0))
 	}
 
-	if xlatedSize, err := info.TranslatedSize(); testutils.IsKernelLessThan(t, "4.13") {
+	if xlatedSize, err := info.TranslatedSize(); testutils.IsVersionLessThan(t, "4.13") {
 		qt.Assert(t, qt.IsNotNil(err))
 	} else {
 		qt.Assert(t, qt.IsNil(err))
 		qt.Assert(t, qt.IsTrue(xlatedSize > 0))
 	}
 
-	if uid, ok := info.CreatedByUID(); testutils.IsKernelLessThan(t, "4.15") {
+	if uid, ok := info.CreatedByUID(); testutils.IsVersionLessThan(t, "4.15") {
 		qt.Assert(t, qt.IsFalse(ok))
 	} else {
 		qt.Assert(t, qt.IsTrue(ok))
 		qt.Assert(t, qt.Equals(uid, uint32(os.Getuid())))
 	}
 
-	if loadTime, ok := info.LoadTime(); testutils.IsKernelLessThan(t, "4.15") {
+	if loadTime, ok := info.LoadTime(); testutils.IsVersionLessThan(t, "4.15") {
 		qt.Assert(t, qt.IsFalse(ok))
 	} else {
 		qt.Assert(t, qt.IsTrue(ok))
 		qt.Assert(t, qt.IsTrue(loadTime > 0))
 	}
 
-	if verifiedInsns, ok := info.VerifiedInstructions(); testutils.IsKernelLessThan(t, "5.16") {
+	if verifiedInsns, ok := info.VerifiedInstructions(); testutils.IsVersionLessThan(t, "5.16") {
 		qt.Assert(t, qt.IsFalse(ok))
 	} else {
 		qt.Assert(t, qt.IsTrue(ok))
 		qt.Assert(t, qt.IsTrue(verifiedInsns > 0))
 	}
 
-	if insns, ok := info.JitedInsns(); testutils.IsKernelLessThan(t, "4.13") {
+	if insns, ok := info.JitedInsns(); testutils.IsVersionLessThan(t, "4.13") {
 		qt.Assert(t, qt.IsFalse(ok))
 	} else {
 		qt.Assert(t, qt.IsTrue(ok))
@@ -155,13 +163,14 @@ func TestProgramInfo(t *testing.T) {
 }
 
 func TestProgramInfoProc(t *testing.T) {
-	prog := createBasicProgram(t)
+	spec := fixupProgramSpec(basicProgramSpec)
+	prog := mustNewProgram(t, spec, nil)
 
 	info, err := newProgramInfoFromProc(prog.fd)
 	testutils.SkipIfNotSupported(t, err)
 	qt.Assert(t, qt.IsNil(err))
 
-	validateProgInfo(t, info)
+	validateProgInfo(t, spec, info)
 }
 
 func TestProgramInfoBTF(t *testing.T) {
@@ -173,28 +182,28 @@ func TestProgramInfoBTF(t *testing.T) {
 
 	// On kernels before 5.x, nr_jited_ksyms is not set for programs without subprogs.
 	// It's included here since this test uses a bpf program with subprogs.
-	if addrs, ok := info.JitedKsymAddrs(); testutils.IsKernelLessThan(t, "4.18") {
+	if addrs, ok := info.JitedKsymAddrs(); testutils.IsVersionLessThan(t, "4.18") {
 		qt.Assert(t, qt.IsFalse(ok))
 	} else {
 		qt.Assert(t, qt.IsTrue(ok))
 		qt.Assert(t, qt.IsTrue(len(addrs) > 0))
 	}
 
-	if lens, ok := info.JitedFuncLens(); testutils.IsKernelLessThan(t, "4.18") {
+	if lens, ok := info.JitedFuncLens(); testutils.IsVersionLessThan(t, "4.18") {
 		qt.Assert(t, qt.IsFalse(ok))
 	} else {
 		qt.Assert(t, qt.IsTrue(ok))
 		qt.Assert(t, qt.IsTrue(len(lens) > 0))
 	}
 
-	if infos, ok := info.JitedLineInfos(); testutils.IsKernelLessThan(t, "5.0") {
+	if infos, ok := info.JitedLineInfos(); testutils.IsVersionLessThan(t, "5.0") {
 		qt.Assert(t, qt.IsFalse(ok))
 	} else {
 		qt.Assert(t, qt.IsTrue(ok))
 		qt.Assert(t, qt.IsTrue(len(infos) > 0))
 	}
 
-	if funcs, err := info.FuncInfos(); testutils.IsKernelLessThan(t, "5.0") {
+	if funcs, err := info.FuncInfos(); testutils.IsVersionLessThan(t, "5.0") {
 		qt.Assert(t, qt.IsNotNil(err))
 	} else {
 		qt.Assert(t, qt.IsNil(err))
@@ -203,7 +212,7 @@ func TestProgramInfoBTF(t *testing.T) {
 		qt.Assert(t, qt.ContentEquals(funcs[1].Func, btfFn))
 	}
 
-	if lines, err := info.LineInfos(); testutils.IsKernelLessThan(t, "5.0") {
+	if lines, err := info.LineInfos(); testutils.IsVersionLessThan(t, "5.0") {
 		qt.Assert(t, qt.IsNotNil(err))
 	} else {
 		qt.Assert(t, qt.IsNil(err))
@@ -232,7 +241,7 @@ func TestProgramInfoMapIDs(t *testing.T) {
 
 	ids, ok := info.MapIDs()
 	switch {
-	case testutils.IsKernelLessThan(t, "4.15"):
+	case testutils.IsVersionLessThan(t, "4.15", "windows:0.20"):
 		qt.Assert(t, qt.IsFalse(ok))
 		qt.Assert(t, qt.HasLen(ids, 0))
 
@@ -257,7 +266,7 @@ func TestProgramInfoMapIDsNoMaps(t *testing.T) {
 
 	ids, ok := info.MapIDs()
 	switch {
-	case testutils.IsKernelLessThan(t, "4.15"):
+	case testutils.IsVersionLessThan(t, "4.15", "windows:0.20"):
 		qt.Assert(t, qt.IsFalse(ok))
 		qt.Assert(t, qt.HasLen(ids, 0))
 
@@ -329,6 +338,7 @@ func TestStats(t *testing.T) {
 	}
 
 	if err := testStats(prog); err != nil {
+		testutils.SkipIfNotSupportedOnOS(t, err)
 		t.Error(err)
 	}
 }
@@ -341,6 +351,7 @@ func BenchmarkStats(b *testing.B) {
 
 	for n := 0; n < b.N; n++ {
 		if err := testStats(prog); err != nil {
+			testutils.SkipIfNotSupportedOnOS(b, err)
 			b.Fatal(fmt.Errorf("iter %d: %w", n, err))
 		}
 	}
@@ -361,19 +372,19 @@ func testStats(prog *Program) error {
 
 	stats, err := EnableStats(uint32(sys.BPF_STATS_RUN_TIME))
 	if err != nil {
-		return fmt.Errorf("failed to enable stats: %v", err)
+		return fmt.Errorf("failed to enable stats: %w", err)
 	}
 	defer stats.Close()
 
 	// Program execution with runtime statistics enabled.
 	// Should increase both runtime and run counter.
 	if _, _, err := prog.Test(in); err != nil {
-		return fmt.Errorf("failed to trigger program: %v", err)
+		return fmt.Errorf("failed to trigger program: %w", err)
 	}
 
 	pi, err := prog.Info()
 	if err != nil {
-		return fmt.Errorf("failed to get ProgramInfo: %v", err)
+		return fmt.Errorf("failed to get ProgramInfo: %w", err)
 	}
 
 	rc, ok := pi.RunCount()
@@ -397,18 +408,18 @@ func testStats(prog *Program) error {
 	lt := rt
 
 	if err := stats.Close(); err != nil {
-		return fmt.Errorf("failed to disable statistics: %v", err)
+		return fmt.Errorf("failed to disable statistics: %w", err)
 	}
 
 	// Second program execution, with runtime statistics gathering disabled.
 	// Total runtime and run counters are not expected to increase.
 	if _, _, err := prog.Test(in); err != nil {
-		return fmt.Errorf("failed to trigger program: %v", err)
+		return fmt.Errorf("failed to trigger program: %w", err)
 	}
 
 	pi, err = prog.Info()
 	if err != nil {
-		return fmt.Errorf("failed to get ProgramInfo: %v", err)
+		return fmt.Errorf("failed to get ProgramInfo: %w", err)
 	}
 
 	rc, ok = pi.RunCount()
